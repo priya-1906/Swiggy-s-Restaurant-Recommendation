@@ -1,0 +1,64 @@
+# data_cleaning.ipynb  
+
+# --- Cell 1: Imports & Paths ---
+import os
+import re
+import numpy as np
+import pandas as pd
+
+RAW_CSV = os.getenv("RAW_CSV", "swiggy_raw.csv")
+CLEAN_CSV = "cleaned_data.csv"
+
+# --- Cell 2: Load ---
+df = pd.read_csv(RAW_CSV)
+
+# --- Cell 3: Basic normalize  ---
+for c in ["name","city","cuisine","lic_no","link","address","menu"]:
+    if c in df.columns:
+        df[c] = (df[c].astype(str)
+                        .str.replace(r"\s+", " ", regex=True)
+                        .str.strip())
+
+# --- Cell 4: Fix datatypes ---
+if "rating" in df.columns:
+    df["rating"] = pd.to_numeric(df["rating"], errors="coerce")
+if "rating_count" in df.columns:
+    df["rating_count"] = pd.to_numeric(df["rating_count"], errors="coerce")
+if "cost" in df.columns:
+    df["cost"] = df["cost"].astype(str).str.replace(r"[^\d.]", "", regex=True)
+    df["cost"] = pd.to_numeric(df["cost"], errors="coerce")
+
+# --- Cell 5: Keep relevant columns, drop dups/empties ---
+keep_cols = ['id','name','city','rating','rating_count','cost','cuisine','lic_no','link','address','menu']
+df = df[[c for c in keep_cols if c in df.columns]].copy()
+df = df.drop_duplicates()
+df = df.dropna(subset=["id","name","city","cuisine"])
+
+# --- Cell 6: Bound rating and cap outliers (IQR) ---
+if "rating" in df.columns:
+    df["rating"] = df["rating"].clip(lower=1, upper=5)
+
+def iqr_cap(s: pd.Series):
+    q1, q3 = s.quantile(0.25), s.quantile(0.75)
+    iqr = q3 - q1
+    lo, hi = q1 - 1.5*iqr, q3 + 1.5*iqr
+    return s.clip(lower=lo, upper=hi)
+
+for col in ["rating_count","cost"]:
+    if col in df.columns:
+        df[col] = iqr_cap(df[col])
+
+# --- Cell 7: Standardize city & cuisine tokens ---
+if "city" in df.columns:
+    df["city"] = (df["city"]
+                  .str.replace(r"\s*,\s*", ",", regex=True)
+                  .str.replace(" ,", ",", regex=False)
+                  .str.title())
+if "cuisine" in df.columns:
+    df["cuisine"] = (df["cuisine"]
+                     .str.lower()
+                     .str.replace(r"\s*,\s*", ",", regex=True))
+
+# --- Cell 8: Save cleaned dataset ---
+df.to_csv(CLEAN_CSV, index=False)
+print("Saved:", CLEAN_CSV, "shape:", df.shape)
