@@ -1,0 +1,79 @@
+# data_preprocessing.ipynb  (cells flattened to plain Python)
+
+# --- Cell 1: Imports & Paths ---
+import os
+import joblib
+import numpy as np
+import pandas as pd
+from scipy import sparse
+from sklearn.preprocessing import OneHotEncoder, RobustScaler, LabelEncoder
+from sklearn.feature_extraction.text import CountVectorizer
+
+CLEAN_CSV = "cleaned_data.csv"
+ENCODED_CSV = "encoded_data.csv"      # optional dense numeric preview
+SPARSE_X = "X.npz"
+ENCODER_PKL = "artifacts/encoder.pkl"
+os.makedirs("artifacts", exist_ok=True)
+
+# --- Cell 2: Load cleaned data ---
+df = pd.read_csv(CLEAN_CSV)
+
+# --- Cell 3: Feature engineering: main_city_bkt & cuisine multihot ---
+def main_city(x: str) -> str:
+    parts = [p.strip() for p in str(x).split(",") if p.strip()]
+    return parts[-1].title() if parts else str(x).title()
+
+df["main_city_bkt"] = df["city"].apply(main_city)
+df["cuisine"] = df["cuisine"].fillna("").astype(str)
+
+cv = CountVectorizer(
+    tokenizer=lambda s: [t.strip() for t in s.split(",") if t.strip()],
+    lowercase=True,
+    binary=True
+)
+cuisine_mh = cv.fit_transform(df["cuisine"])
+
+# --- Cell 4: Numeric transforms ---
+df["rating"] = df["rating"].fillna(df["rating"].median())
+df["rating_count"] = df["rating_count"].fillna(0)
+df["cost"] = df["cost"].fillna(df["cost"].median())
+
+df["rating_count_log"] = np.log1p(df["rating_count"])
+df["cost_log"] = np.log1p(df["cost"])
+num_cols = ["rating","rating_count_log","cost_log"]
+num_mat = df[num_cols].to_numpy()
+
+# --- Cell 5: City OneHot & scale numeric ---
+ohe = OneHotEncoder(handle_unknown="ignore", sparse_output=True)
+city_oh = ohe.fit_transform(df[["main_city_bkt"]])
+
+scaler = RobustScaler()
+num_scaled = scaler.fit_transform(num_mat)
+
+# --- Cell 6: Assemble sparse feature matrix X ---
+X = sparse.hstack([sparse.csr_matrix(num_scaled), city_oh, cuisine_mh], format="csr")
+
+# --- Cell 7: LabelEncoder (optional) ---
+le_name = LabelEncoder()
+_ = le_name.fit(df["name"].astype(str))
+
+# --- Cell 8: Save artifacts ---
+encoded_df = pd.DataFrame(num_scaled, columns=num_cols)
+encoded_df.to_csv(ENCODED_CSV, index=False)
+sparse.save_npz(SPARSE_X, X)
+
+enc_bundle = {
+    "one_hot_encoder": ohe,
+    "scaler": scaler,
+    "label_encoder_name": le_name,
+    "count_vectorizer_cuisine": cv,
+    "cat_cols": ["main_city_bkt","cuisine"],
+    "num_cols": num_cols,
+    "city_feature_names": [f"city__{c}" for c in ohe.get_feature_names_out(["main_city_bkt"])],
+    "cuisine_feature_names": [f"cuisine__{t}" for t in cv.get_feature_names_out()]
+}
+joblib.dump(enc_bundle, ENCODER_PKL, compress=3)
+
+print("Saved:", ENCODED_CSV, encoded_df.shape)
+print("Saved:", SPARSE_X, X.shape)
+print("Saved:", ENCODER_PKL)
