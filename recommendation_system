@@ -1,0 +1,87 @@
+# recommendation_system.ipynb 
+
+# --- Cell 1: Imports & load artifacts ---
+import joblib
+import numpy as np
+import pandas as pd
+from scipy import sparse
+from sklearn.metrics.pairwise import cosine_similarity
+
+CLEAN_CSV = "cleaned_data.csv"
+SPARSE_X = "X.npz"
+ENCODER_PKL = "artifacts/encoder.pkl"
+
+df = pd.read_csv(CLEAN_CSV)
+X = sparse.load_npz(SPARSE_X)
+enc = joblib.load(ENCODER_PKL)
+
+ohe = enc["one_hot_encoder"]
+scaler = enc["scaler"]
+cv = enc["count_vectorizer_cuisine"]
+num_cols = enc["num_cols"]
+
+if "main_city_bkt" not in df.columns:
+    def main_city(x: str) -> str:
+        parts = [p.strip() for p in str(x).split(",") if p.strip()]
+        return parts[-1].title() if parts else str(x).title()
+    df["main_city_bkt"] = df["city"].apply(main_city)
+
+# --- Cell 2: Query vector builder ---
+def make_query_vector(city: str, cuisine_list, rating: float, cost: float, rating_count: float = 0):
+    num = np.array([[rating, np.log1p(rating_count), np.log1p(cost)]], dtype=float)
+    num_scaled = scaler.transform(num)
+    city_df = pd.DataFrame({"main_city_bkt":[city]})
+    city_oh = ohe.transform(city_df)
+    if isinstance(cuisine_list, str):
+        cuisine_list = [c.strip() for c in cuisine_list.split(",") if c.strip()]
+    cuisine_mh = cv.transform([",".join(cuisine_list or [])])
+    return sparse.hstack([sparse.csr_matrix(num_scaled), city_oh, cuisine_mh], format="csr")
+
+# --- Cell 3: Item-to-item by name ---
+def recommend_similar_by_name(name: str, top_k: int = 10):
+    idx = df.index[df["name"].str.lower() == str(name).lower()]
+    if len(idx) == 0:
+        return pd.DataFrame()
+    i = int(idx[0])
+    sims = cosine_similarity(X[i], X).ravel()
+    order = np.argsort(-sims)
+    order = order[order != i][:top_k]
+    out = df.loc[order, ["id","name","city","cuisine","rating","cost"]].copy()
+    out["similarity"] = sims[order]
+    return out.reset_index(drop=True)
+
+# --- Cell 4: Preference-based ---
+def recommend_by_preferences(city: str,
+                             cuisine_list,
+                             rating_min: float = 0.0,
+                             cost_min: float = 0.0,
+                             cost_max: float = None,
+                             top_k: int = 20):
+    anchor_cost = (cost_min + (cost_max or cost_min or 0)) / 2 if (cost_max or cost_min) else df["cost"].median()
+    xq = make_query_vector(city=city, cuisine_list=cuisine_list,
+                           rating=max(rating_min, 0), cost=max(anchor_cost, 0),
+                           rating_count=0)
+    sims = cosine_similarity(xq, X).ravel()
+
+    mask = (df["rating"] >= rating_min)
+    if cost_min: mask &= (df["cost"] >= cost_min)
+    if cost_max: mask &= (df["cost"] <= cost_max)
+    if city: mask &= (df["city"].str.contains(city, case=False, na=False) | df["main_city_bkt"].str.contains(city, case=False, na=False))
+    if cuisine_list:
+        if isinstance(cuisine_list, str):
+            cuisine_list = [c.strip() for c in cuisine_list.split(",") if c.strip()]
+        for cu in cuisine_list:
+            mask &= df["cuisine"].str.contains(cu, case=False, na=False)
+
+    idx = np.where(mask.values)[0]
+    if idx.size == 0:
+        return pd.DataFrame()
+
+    order = idx[np.argsort(-sims[idx])][:top_k]
+    out = df.loc[order, ["id","name","city","cuisine","rating","cost"]].copy()
+    out["similarity"] = sims[order]
+    return out.reset_index(drop=True)
+
+# --- Cell 5: Samples (commented) ---
+# print(recommend_similar_by_name("Biryani Bowl Company", 10).head())
+# print(recommend_by_preferences("Bangalore", ["biryani"], 4.0, 200, 600, 15).head())
