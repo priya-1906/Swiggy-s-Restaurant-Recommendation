@@ -1,0 +1,125 @@
+# streamlit_application.py
+
+import joblib
+import numpy as np
+import pandas as pd
+import streamlit as st
+from scipy import sparse
+from sklearn.metrics.pairwise import cosine_similarity
+
+st.set_page_config(page_title="Swiggy Recommender", page_icon="🍜", layout="wide")
+
+@st.cache_resource
+def load_all():
+    df = pd.read_csv("cleaned_data.csv")
+    enc = joblib.load("artifacts/encoder.pkl")
+    X = sparse.load_npz("X.npz")
+    return df, enc, X
+
+df, enc, X = load_all()
+ohe = enc["one_hot_encoder"]
+scaler = enc["scaler"]
+cv = enc["count_vectorizer_cuisine"]
+
+if "main_city_bkt" not in df.columns:
+    def main_city(x: str) -> str:
+        parts = [p.strip() for p in str(x).split(",") if p.strip()]
+        return parts[-1].title() if parts else str(x).title()
+    df["main_city_bkt"] = df["city"].apply(main_city)
+
+def make_query_vector(city: str, cuisine_list, rating: float, cost: float, rating_count: float = 0):
+    num = np.array([[rating, np.log1p(rating_count), np.log1p(cost)]], dtype=float)
+    num_scaled = scaler.transform(num)
+    city_df = pd.DataFrame({"main_city_bkt":[city]})
+    city_oh = ohe.transform(city_df)
+    if isinstance(cuisine_list, str):
+        cuisine_list = [c.strip() for c in cuisine_list.split(",") if c.strip()]
+    cuisine_mh = cv.transform([",".join(cuisine_list or [])])
+    return sparse.hstack([sparse.csr_matrix(num_scaled), city_oh, cuisine_mh], format="csr")
+
+def recommend_similar_by_name(name: str, top_k: int = 10):
+    idx = df.index[df["name"].str.lower() == str(name).lower()]
+    if len(idx) == 0:
+        return pd.DataFrame()
+    i = int(idx[0])
+    sims = cosine_similarity(X[i], X).ravel()
+    order = np.argsort(-sims)
+    order = order[order != i][:top_k]
+    out = df.loc[order, ["id","name","city","cuisine","rating","cost"]].copy()
+    out["similarity"] = sims[order]
+    return out.reset_index(drop=True)
+
+def recommend_by_preferences(city: str,
+                             cuisine_list,
+                             rating_min: float = 0.0,
+                             cost_min: float = 0.0,
+                             cost_max: float = None,
+                             top_k: int = 20):
+    anchor_cost = (cost_min + (cost_max or cost_min or 0)) / 2 if (cost_max or cost_min) else df["cost"].median()
+    xq = make_query_vector(city=city, cuisine_list=cuisine_list,
+                           rating=max(rating_min, 0), cost=max(anchor_cost, 0),
+                           rating_count=0)
+    sims = cosine_similarity(xq, X).ravel()
+
+    mask = (df["rating"] >= rating_min)
+    if cost_min: mask &= (df["cost"] >= cost_min)
+    if cost_max: mask &= (df["cost"] <= cost_max)
+    if city: mask &= (df["city"].str.contains(city, case=False, na=False) | df["main_city_bkt"].str.contains(city, case=False, na=False))
+    if cuisine_list:
+        if isinstance(cuisine_list, str):
+            cuisine_list = [c.strip() for c in cuisine_list.split(",") if c.strip()]
+        for cu in cuisine_list:
+            mask &= df["cuisine"].str.contains(cu, case=False, na=False)
+
+    idx = np.where(mask.values)[0]
+    if idx.size == 0:
+        return pd.DataFrame()
+
+    order = idx[np.argsort(-sims[idx])][:top_k]
+    out = df.loc[order, ["id","name","city","cuisine","rating","cost"]].copy()
+    out["similarity"] = sims[order]
+    return out.reset_index(drop=True)
+
+st.title("🍜 Swiggy Restaurant Recommendation System")
+
+tab1, tab2 = st.tabs(["🔎 Select Restaurant", "🎯 Custom Preferences"])
+
+with tab1:
+    st.subheader("Find restaurants similar to a chosen one")
+    c1, c2 = st.columns([2,1])
+    with c1:
+        name = st.selectbox("Restaurant", sorted(df["name"].astype(str).unique()))
+    with c2:
+        k = st.number_input("Top K", 1, 50, 10, 1)
+    if st.button("Get Similar"):
+        res = recommend_similar_by_name(name, top_k=k)
+        st.dataframe(res, use_container_width=True)
+
+with tab2:
+    st.subheader("Get recommendations by your preferences")
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        city = st.selectbox("City", sorted(df["main_city_bkt"].astype(str).unique()))
+    with c2:
+        cuisines_all = sorted({t.strip() for s in df["cuisine"].dropna().astype(str) for t in s.split(",") if t.strip()})
+        cuisine_sel = st.multiselect("Cuisine(s)", cuisines_all[:1000])
+    with c3:
+        rating_min = st.slider("Min Rating", 0.0, 5.0, 4.0, 0.1)
+
+    c4, c5, c6 = st.columns(3)
+    with c4:
+        cost_min = st.number_input("Min Cost", 0, 100000, 200, 50)
+    with c5:
+        cost_max_in = st.number_input("Max Cost (0 = no limit)", 0, 100000, 600, 50)
+        cost_max = None if cost_max_in == 0 else cost_max_in
+    with c6:
+        k2 = st.number_input("Top K", 1, 100, 20, 1)
+
+    if st.button("Recommend"):
+        res = recommend_by_preferences(city=city,
+                                       cuisine_list=cuisine_sel,
+                                       rating_min=rating_min,
+                                       cost_min=cost_min,
+                                       cost_max=cost_max,
+                                       top_k=k2)
+        st.dataframe(res, use_container_width=True)
